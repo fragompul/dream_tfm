@@ -1,0 +1,31 @@
+{
+    "Weighted_All": {
+        "description": "Dynamic Inverse MSE Weighting",
+        "weights": {
+            "Pred_RIDGE": 0.2030780716733344,
+            "Pred_RANDOMFOREST": 0.19868341947008406,
+            "Pred_XGBOOST": 0.19057729377820112,
+            "Pred_LIGHTGBM": 0.18550044012062442,
+            "Pred_LSTM": 0.11715068061458264,
+            "Pred_GRU": 0.10501009434317332
+        }
+    },
+    "Simple_All": {
+        "description": "Simple Mean of all baseline models",
+        "models": [
+            "Pred_RIDGE",
+            "Pred_RANDOMFOREST",
+            "Pred_XGBOOST",
+            "Pred_LIGHTGBM",
+            "Pred_LSTM",
+            "Pred_GRU"
+        ]
+    },
+    "Top_2": {
+        "description": "Simple Mean of the top 2 performing models",
+        "models": [
+            "Pred_RIDGE",
+            "Pred_RANDOMFOREST"
+        ]
+    }
+}
