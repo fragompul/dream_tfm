@@ -11,7 +11,7 @@ Si se instala el archivo de requerimientos primero, librerías como `lightning` 
 
 #### 1. Crear y activar el entorno (Conda recomendado)
 ```bash
-conda create -n dream_tfm python=3.13
+conda create -n dream_tfm python=3.13.5
 conda activate dream_tfm
 ```
 
