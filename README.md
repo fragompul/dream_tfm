@@ -1,11 +1,9 @@
 # dream_tfm
 D.R.E.A.M.: Arquitectura Multi-Agente para Trading basada en Fusión de Sentimiento y Volatilidad
 
-## 🚀 Instalación y Configuración
+## Instalación y Configuración
 
-### ⚠️ IMPORTANTE: Orden de Instalación (Soporte GPU)
-
-Para garantizar que el proyecto utilice la **GPU (NVIDIA H100)** y no la versión de CPU por defecto, es **obligatorio** instalar PyTorch manualmente antes de procesar el archivo `requirements.txt`. 
+Para garantizar que el proyecto utilice la **GPU** y no la versión de CPU por defecto, es **obligatorio** instalar PyTorch manualmente antes de procesar el archivo `requirements.txt`. 
 
 Si se instala el archivo de requerimientos primero, librerías como `lightning` o `pytorch-forecasting` podrían instalar una versión genérica de PyTorch que no detectará tu hardware.
 
