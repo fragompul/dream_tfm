@@ -1,0 +1,14 @@
+pandas
+numpy
+yfinance
+datasets
+matplotlib
+seaborn
+scikit-learn
+xgboost
+lightgbm
+optuna
+joblib
+torch
+lightning
+pytorch-forecasting
