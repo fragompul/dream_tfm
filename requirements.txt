@@ -9,7 +9,6 @@ xgboost
 lightgbm
 optuna
 joblib
-torch
 lightning
 pytorch-forecasting
 ipykernel
