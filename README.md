@@ -13,11 +13,14 @@ Si se instala el archivo de requerimientos primero, librerías como `lightning` 
 ```bash
 conda create -n dream_tfm python=3.13
 conda activate dream_tfm
+```
 
 #### 2. Instalar PyTorch con binarios de CUDA
 ```bash
 pip install torch torchvision torchaudio --index-url https://download.pytorch.org/whl/cu128
+```
 
 #### 3. Instalar el resto de dependencias
 ```bash
 pip install -r requirements.txt
+```
