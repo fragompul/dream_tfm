@@ -12,3 +12,4 @@ joblib
 torch
 lightning
 pytorch-forecasting
+ipykernel
