@@ -1,3 +1,0 @@
-models/finbert_full_finetuned/checkpoint-*/ 
-*.pt 
-*.safetensors 
