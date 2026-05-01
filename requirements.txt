@@ -12,3 +12,7 @@ joblib
 lightning
 pytorch-forecasting
 ipykernel
+transformers
+torch
+accelerate
+peft
