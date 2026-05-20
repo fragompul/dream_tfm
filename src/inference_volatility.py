@@ -117,7 +117,7 @@ def fetch_and_prepare_data(ticker, asset_class):
 
     # Base Features
     df['log_return'] = np.log(df['Close'] / df['Close'].shift(1))
-    df['historical_volatility_20d'] = df['log_return'].rolling(window=20).std()
+    df['historical_volatility_20d'] = df['log_return'].rolling(window=20).std() * np.sqrt(252)
 
     # Lag Features for ML models
     df['log_return_lag1'] = df['log_return'].shift(1)
