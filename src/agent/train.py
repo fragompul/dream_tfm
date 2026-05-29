@@ -1,8 +1,8 @@
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 
-from agente.src.data_feed import WyckoffMockData
-from agente.src.dream_env import DreamEnv
+from src.agent.data_feed import WyckoffMockData
+from src.agent.dream_env import DreamEnv
 
 def train_dream_agent():
     """
