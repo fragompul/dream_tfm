@@ -6,8 +6,8 @@ import seaborn as sns
 import numpy as np
 from stable_baselines3 import PPO
 
-from agente.src.data_feed import WyckoffMockData
-from agente.src.dream_env import DreamEnv
+from src.agent.data_feed import WyckoffMockData
+from src.agent.dream_env import DreamEnv
 
 def calculate_financial_metrics(portfolio_values, prices):
     """
