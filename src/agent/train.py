@@ -10,7 +10,7 @@ def train_dream_agent():
     """
     # Incrementamos los datos a 300,000 steps y los ciclos de mercado a 2,000 steps 
     # para permitir tendencias sostenidas donde el agente pueda mantener posiciones rentables.
-    mock_data = WyckoffMockData(steps=1000, cycle_length=250)
+    mock_data = WyckoffMockData(steps=1000)
     env = DreamEnv(mock_data)
     
     # Verificación de integridad

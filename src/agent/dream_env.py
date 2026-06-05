@@ -21,7 +21,7 @@ class DreamEnv(gym.Env):
         # Se normalizan los límites para estabilizar la convergencia de PPO
         self.observation_space = spaces.Box(
             low=np.array([-1.0, 0.0, 0.0, -np.inf, 0.0], dtype=np.float32),
-            high=np.array([1.0, 1.0, np.inf, np.inf, np.inf], dtype=np.float32),
+            high=np.array([1.0, 2.0, np.inf, np.inf, np.inf], dtype=np.float32),
             dtype=np.float32
         )
         
