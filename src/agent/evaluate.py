@@ -7,9 +7,11 @@ import seaborn as sns
 import numpy as np
 import pandas as pd
 from stable_baselines3 import PPO
+from scipy.stats import pearsonr
 
 from data_feed import WyckoffMockData
 from dream_env import DreamEnv
+
 
 def calculate_academic_metrics(portfolio_values, prices):
     """
@@ -187,16 +189,230 @@ def generate_advanced_dashboard(agent_paths, bh_paths, df_metrics, output_img):
     plt.close(fig)
     print(f"Dashboard de Monte Carlo guardado con éxito en: {output_img}")
 
+class DreamEvaluator:
+    def __init__(self, model_path, num_runs=30, steps=600, commission_rate=0.001):
+        self.model_path = model_path
+        self.num_runs = num_runs
+        self.steps = steps
+        self.commission_rate = commission_rate
+        
+        print(f"Cargando agente PPO continuo desde {self.model_path}...")
+        self.model = PPO.load(self.model_path, device="cpu")
+
+    def _calculate_financials(self, portfolio_values, prices):
+        """Dimensión 1: Métricas Financieras (Alpha y Riesgo)"""
+        port_values = np.array(portfolio_values)
+        price_values = np.array(prices)
+        
+        port_returns = np.diff(port_values) / port_values[:-1]
+        bh_returns = np.diff(price_values) / price_values[:-1]
+        
+        # Sharpe
+        mean_return = np.mean(port_returns)
+        std_return = np.std(port_returns)
+        sharpe = (mean_return / std_return) * np.sqrt(252) if std_return > 0 else 0.0
+        
+        # Sortino Académico (MAR = 0)
+        downside_returns = port_returns[port_returns < 0]
+        if len(port_returns) > 0:
+            downside_variance = np.sum(downside_returns ** 2) / len(port_returns)
+            down_std = np.sqrt(downside_variance)
+        else:
+            down_std = 1e-6
+        down_std = 1e-6 if down_std == 0 else down_std
+        sortino = (mean_return / down_std) * np.sqrt(252)
+        
+        # MDD
+        cum_returns = port_values / port_values[0]
+        running_max = np.maximum.accumulate(cum_returns)
+        drawdowns = (cum_returns - running_max) / running_max
+        mdd = abs(np.min(drawdowns)) * 100.0
+        
+        # Calmar Ratio
+        annualized_return = (mean_return * 252) * 100 
+        calmar = annualized_return / mdd if mdd > 0 else 0.0
+        
+        # Win Rate vs B&H
+        outperforming_periods = np.sum(port_returns > bh_returns)
+        win_rate = (outperforming_periods / len(port_returns)) * 100.0 if len(port_returns) > 0 else 0.0
+        
+        total_ret_agent = ((port_values[-1] / port_values[0]) - 1) * 100
+        total_ret_bh = ((price_values[-1] / price_values[0]) - 1) * 100
+        
+        return {
+            "Sharpe": sharpe,
+            "Sortino": sortino,
+            "MDD": mdd,
+            "Calmar": calmar,
+            "WinRate": win_rate,
+            "Total_Ret_Agent": total_ret_agent,
+            "Total_Ret_BH": total_ret_bh
+        }
+
+    def _calculate_behavior(self, exposures, sentiments, volatilities):
+        """Dimensión 2: Comportamiento (Psicología de la Política)"""
+        exposures_arr = np.array(exposures)
+        sentiments_arr = np.array(sentiments)
+        vols_arr = np.array(volatilities)
+        
+        # 1. Exposición Media al Mercado
+        avg_exposure = np.mean(exposures_arr) * 100.0
+        
+        # 2. Tasa de Rotación (Turnover): Suma de cambios absolutos en exposición
+        turnover = np.sum(np.abs(np.diff(exposures_arr))) / len(exposures_arr)
+        
+        # 3. Correlaciones (¿Hace caso a los sensores?)
+        # Añadimos un pequeño ruido para evitar errores si la exposición es constante
+        corr_sent, _ = pearsonr(exposures_arr + np.random.normal(0, 1e-6, len(exposures_arr)), sentiments_arr)
+        corr_vol, _ = pearsonr(exposures_arr + np.random.normal(0, 1e-6, len(exposures_arr)), vols_arr)
+        
+        return {
+            "Avg_Exposure": avg_exposure,
+            "Turnover": turnover,
+            "Corr_Sentiment": corr_sent,
+            "Corr_Volatility": corr_vol
+        }
+
+    def run_monte_carlo(self):
+        """Dimensión 3: Evaluación de Robustez sobre N Mercados Ocultos"""
+        np.random.seed(42)
+        
+        test_data = WyckoffMockData(steps=self.steps)
+        eval_env = DreamEnv(test_data)
+        
+        self.agent_paths = []
+        self.bh_paths = []
+        self.all_financials = []
+        self.all_behaviors = []
+        
+        print(f"Iniciando simulación de Monte Carlo ({self.num_runs} ejecuciones)...")
+        for run in range(self.num_runs):
+            obs, _ = eval_env.reset()
+            
+            portfolio_values = [eval_env.initial_balance]
+            prices = [test_data.prices[0]]
+            
+            exposures = [0.0]
+            sentiments = [obs[0]]
+            volatilities = [obs[1]]
+            
+            for _ in range(self.steps - 1):
+                action, _ = self.model.predict(obs, deterministic=True)
+                obs, reward, terminated, truncated, info = eval_env.step(action)
+                
+                # Extracción de telemetría en cada step
+                current_price, current_sent, current_vol = test_data.get_step_data(eval_env.current_step)
+                current_exposure = (eval_env.position_size * current_price) / info['portfolio_value'] if info['portfolio_value'] > 0 else 0.0
+                
+                prices.append(current_price)
+                portfolio_values.append(info['portfolio_value'])
+                exposures.append(current_exposure)
+                sentiments.append(current_sent)
+                volatilities.append(current_vol)
+                
+                if terminated or truncated:
+                    break
+                    
+            # Análisis de la trayectoria (Run)
+            fin_metrics = self._calculate_financials(portfolio_values, prices)
+            beh_metrics = self._calculate_behavior(exposures, sentiments, volatilities)
+            
+            self.all_financials.append(fin_metrics)
+            self.all_behaviors.append(beh_metrics)
+            
+            # Normalización para gráficos
+            norm_agent = np.array(portfolio_values) / eval_env.initial_balance
+            norm_bh = (1.0 - self.commission_rate) * (np.array(prices) / prices[0])
+            self.agent_paths.append(norm_agent)
+            self.bh_paths.append(norm_bh)
+            
+        self.df_fin = pd.DataFrame(self.all_financials)
+        self.df_beh = pd.DataFrame(self.all_behaviors)
+        return self.df_fin, self.df_beh
+
+    def plot_dashboard(self, output_img="test_modelos/dream_eval_dashboard.png"):
+        """Renderiza el panel de control integral con métricas financieras y conductuales."""
+        sns.set_theme(style="darkgrid")
+        fig, axes = plt.subplots(3, 2, figsize=(18, 16))
+        time_steps = range(np.array(self.agent_paths).shape[1])
+        
+        # 1. Caminos de Inversión
+        mean_ag = np.mean(self.agent_paths, axis=0)
+        std_ag = np.std(self.agent_paths, axis=0)
+        mean_bh = np.mean(self.bh_paths, axis=0)
+        std_bh = np.std(self.bh_paths, axis=0)
+        
+        axes[0, 0].plot(time_steps, mean_ag, color='green', lw=2, label='D.R.E.A.M.')
+        axes[0, 0].fill_between(time_steps, mean_ag - std_ag, mean_ag + std_ag, color='green', alpha=0.15)
+        axes[0, 0].plot(time_steps, mean_bh, color='darkorange', ls='--', lw=2, label='Buy & Hold')
+        axes[0, 0].fill_between(time_steps, mean_bh - std_bh, mean_bh + std_bh, color='darkorange', alpha=0.1)
+        axes[0, 0].set_title('Evolución de Capital (Monte Carlo)', fontweight='bold')
+        axes[0, 0].legend()
+
+        # 2. Distribución Sharpe
+        sns.histplot(self.df_fin['Sharpe'], ax=axes[0, 1], kde=True, color='blue')
+        axes[0, 1].axvline(1.0, color='red', ls=':', label="Objetivo > 1.0")
+        axes[0, 1].set_title('Distribución Ratio de Sharpe', fontweight='bold')
+        axes[0, 1].legend()
+
+        # 3. Dispersión MDD
+        sns.boxplot(x=self.df_fin['MDD'], ax=axes[1, 0], color='salmon')
+        axes[1, 0].axvline(20.0, color='red', ls=':', label="Techo < 20%")
+        axes[1, 0].set_title('Dispersión Máximo Drawdown (%)', fontweight='bold')
+        axes[1, 0].legend()
+
+        # 4. Comportamiento: Exposición y Correlación
+        sns.scatterplot(x=self.df_beh['Avg_Exposure'], y=self.df_fin['Sharpe'], ax=axes[1, 1], color='purple')
+        axes[1, 1].set_title('Comportamiento: Exposición Media vs Sharpe', fontweight='bold')
+        axes[1, 1].set_xlabel('Exposición Media (%)')
+        
+        # 5. Caja de Métricas Financieras
+        axes[2, 0].axis('off')
+        txt_fin = (
+            r"$\bf{MÉTRICAS\ FINANCIERAS\ (Dimensión\ 1\ &\ 3)}$" + "\n"
+            f"Sharpe Medio:    {self.df_fin['Sharpe'].mean():.2f} ± {self.df_fin['Sharpe'].std():.2f}\n"
+            f"Sortino Medio:   {self.df_fin['Sortino'].mean():.2f} ± {self.df_fin['Sortino'].std():.2f}\n"
+            f"Calmar Ratio:    {self.df_fin['Calmar'].mean():.2f} ± {self.df_fin['Calmar'].std():.2f}\n"
+            f"Máximo Drawdown: {self.df_fin['MDD'].mean():.2f}% ± {self.df_fin['MDD'].std():.2f}%\n"
+            f"Win Rate (B&H):  {self.df_fin['WinRate'].mean():.2f}%\n"
+            f"Retorno Agente:  {self.df_fin['Total_Ret_Agent'].mean():.2f}%\n"
+            f"Retorno B&H:     {self.df_fin['Total_Ret_BH'].mean():.2f}%"
+        )
+        axes[2, 0].text(0.1, 0.9, txt_fin, fontsize=12, va='top', bbox=dict(boxstyle='round', facecolor='white'))
+
+        # 6. Caja de Métricas de Comportamiento
+        axes[2, 1].axis('off')
+        txt_beh = (
+            r"$\bf{MÉTRICAS\ DE\ COMPORTAMIENTO\ (Dimensión\ 2)}$" + "\n"
+            f"Exposición Media:      {self.df_beh['Avg_Exposure'].mean():.2f}%\n"
+            f"Turnover (Rotación):   {self.df_beh['Turnover'].mean():.4f} por step\n\n"
+            r"$\bf{Correlación\ de\ la\ Política\ (Fusión\ de\ Datos)}$" + "\n"
+            f"Corr vs Sentimiento:   {self.df_beh['Corr_Sentiment'].mean():.2f} (Esperado: > 0)\n"
+            f"Corr vs Volatilidad:   {self.df_beh['Corr_Volatility'].mean():.2f} (Esperado: < 0)"
+        )
+        axes[2, 1].text(0.1, 0.9, txt_beh, fontsize=12, va='top', bbox=dict(boxstyle='round', facecolor='white'))
+
+        plt.tight_layout()
+        os.makedirs(os.path.dirname(output_img), exist_ok=True)
+        plt.savefig(output_img, dpi=300)
+        plt.close(fig)
+        print(f"Evaluación completada. Dashboard guardado en: {output_img}")
+
+
 if __name__ == "__main__":
-    # Configuración de rutas
-    model_path = "models/dream_agent.zip"
-    output_img = "test_modelos/backtest_monte_carlo_tfm.png"
+    # # Configuración de rutas
+    # model_path = "models/dream_agent.zip"
+    # output_img = "test_modelos/backtest_monte_carlo_tfm.png"
     
-    # Asegurar que el directorio de salida existe
-    os.makedirs(os.path.dirname(output_img), exist_ok=True)
+    # # Asegurar que el directorio de salida existe
+    # os.makedirs(os.path.dirname(output_img), exist_ok=True)
     
-    # Ejecución del motor estadístico
-    agent_paths, bh_paths, df_metrics = run_monte_carlo_evaluation(model_path, num_runs=100, steps=252*5)
+    # # Ejecución del motor estadístico
+    # agent_paths, bh_paths, df_metrics = run_monte_carlo_evaluation(model_path, num_runs=100, steps=252*5)
     
-    # Generación de gráficos finales
-    generate_advanced_dashboard(agent_paths, bh_paths, df_metrics, output_img)
+    # # Generación de gráficos finales
+    # generate_advanced_dashboard(agent_paths, bh_paths, df_metrics, output_img)
+    
+    evaluator = DreamEvaluator(model_path="models/dream_agent.zip", num_runs=30, steps=600)
+    evaluator.run_monte_carlo()
+    evaluator.plot_dashboard()
