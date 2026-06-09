@@ -2,3 +2,6 @@
 models/**/checkpoint-*/ 
 .vscode/
 test_modelos
+data/interim/*
+data/raw/*
+__pycache__/
