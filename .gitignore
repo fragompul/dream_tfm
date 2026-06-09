@@ -5,3 +5,5 @@ test_modelos
 data/interim/*
 data/raw/*
 __pycache__/
+"notebooks/DREAM_NLP_Weekly_Sentiment.ipynb" 
+".env" 

@@ -19,3 +19,4 @@ peft
 stable-baselines3
 gymnasium
 tensorboard
+peft
