@@ -1,5 +1,5 @@
 """
-D.R.E.A.M. Evaluation Engine — Phase 5
+D.R.E.A.M. Evaluation Engine — Phase 6
 
 Evaluates a trained PPO agent using Monte Carlo rollouts over synthetic
 WyckoffMockData episodes.  Fully compatible with both sentiment modes
@@ -36,6 +36,7 @@ import numpy as np
 import pandas as pd
 from scipy.stats import pearsonr
 from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
 
 from src.agent.data_feed import WyckoffMockData, EmpiricalDataFeed
 from src.agent.dream_env import DreamEnv
@@ -45,37 +46,39 @@ from src.agent.config import RANDOM_SEED
 # Evaluation configuration — edit these to match the experiment being evaluated
 # =============================================================================
 
-MODEL_PATH:     str = "test_modelos/dream_empirical_macro_N3_v5.zip"
-NUM_ASSETS:     int = 3
-SENTIMENT_MODE: str = "macro"       # "macro" | "per_asset"
-SENTIMENT_LAG:  int = 2
-NUM_RUNS:       int = 30
-EVAL_STEPS:     int = 512
-DATA_MODE:      str = "empirical"   # "synthetic" | "empirical"
-CSV_PATH:       str = "data/backtest_agent_dataset.csv"
-OUTPUT_IMG:     str = "test_modelos/eval_exp4_empirical_real_N3.png"
+MODEL_PATH   = "test_modelos/dream_empirical_macro_N3_v6.zip"
+VECNORM_PATH = "test_modelos/dream_empirical_macro_N3_v6_vecnorm.pkl"
+NUM_ASSETS = 3
+SENTIMENT_MODE:  str = "macro"   # "macro" | "per_asset"
+SENTIMENT_LAG:   int = 2
+NUM_RUNS:        int = 30
+EVAL_STEPS:      int = 1000
+DATA_MODE:       str = "empirical"   # "synthetic" | "empirical"
+CSV_PATH:        str = "data/backtest_agent_dataset.csv"
+OUTPUT_IMG:      str = "test_modelos/eval_exp4_empirical_N3_v6.png"
 
-# Experiment guide
-# ----------------
+# Experiment guide (Phase 6 — v6 models)
+# ------------------------------------------
 # Exp 1 — pipeline sanity check (synthetic macro, N=2):
-#     MODEL_PATH = "test_modelos/dream_synthetic_macro_N2_v5.zip"
+#     MODEL_PATH   = "test_modelos/dream_synthetic_macro_N2_v6.zip"
+#     VECNORM_PATH = "test_modelos/dream_synthetic_macro_N2_v6_vecnorm.pkl"
 #     NUM_ASSETS = 2;  SENTIMENT_MODE = "macro";  DATA_MODE = "synthetic"
-#     EVAL_STEPS = 512
 #
 # Exp 2 — per-asset signal (synthetic per_asset, N=3):
-#     MODEL_PATH = "test_modelos/dream_synthetic_per_asset_N3_v5.zip"
+#     MODEL_PATH   = "test_modelos/dream_synthetic_per_asset_N3_v6.zip"
+#     VECNORM_PATH = "test_modelos/dream_synthetic_per_asset_N3_v6_vecnorm.pkl"
 #     NUM_ASSETS = 3;  SENTIMENT_MODE = "per_asset";  DATA_MODE = "synthetic"
-#     EVAL_STEPS = 512
 #
 # Exp 3 — macro multi-asset (synthetic macro, N=3):
-#     MODEL_PATH = "test_modelos/dream_synthetic_macro_N3_v5.zip"
+#     MODEL_PATH   = "test_modelos/dream_synthetic_macro_N3_v6.zip"
+#     VECNORM_PATH = "test_modelos/dream_synthetic_macro_N3_v6_vecnorm.pkl"
 #     NUM_ASSETS = 3;  SENTIMENT_MODE = "macro";  DATA_MODE = "synthetic"
-#     EVAL_STEPS = 512
 #
 # Exp 4 — empirical backtest (real data):
-#     MODEL_PATH = "test_modelos/dream_empirical_macro_N3_v5.zip"
+#     MODEL_PATH   = "test_modelos/dream_empirical_macro_N3_v6.zip"
+#     VECNORM_PATH = "test_modelos/dream_empirical_macro_N3_v6_vecnorm.pkl"
 #     NUM_ASSETS = 3;  SENTIMENT_MODE = "macro";  DATA_MODE = "empirical"
-#     CSV_PATH   = "data/backtest_agent_dataset.csv";  EVAL_STEPS = 512
+#     CSV_PATH     = "data/backtest_agent_dataset.csv"
 
 
 # =============================================================================
@@ -170,6 +173,7 @@ class DreamEvaluator:
         initial_balance: float = 10_000.0,
         data_mode: str = "synthetic",
         csv_path: str = "data/backtest_agent_dataset.csv",
+        vecnorm_path: str | None = None,
     ):
         """
         Args:
@@ -189,20 +193,29 @@ class DreamEvaluator:
         self.steps           = steps
         self.commission_rate = commission_rate
         self.initial_balance = initial_balance
-        self.data_mode = data_mode
-        self.csv_path  = csv_path
+        self.data_mode    = data_mode
+        self.csv_path     = csv_path
+        self.vecnorm_path = vecnorm_path
 
-        # Build a throw-away env so PPO.load receives the correct observation
-        # and action spaces. Without env=, SB3 uses the spaces stored in the
-        # .zip (from training) and raises a shape mismatch when eval N or
-        # sentiment_mode differ from what was used at training time.
+        # Build throw-away env for PPO.load space matching.
+        # For Phase 6 models, wrap with VecNormalize using saved
+        # running stats so the reward scale matches training.
         _data = WyckoffMockData(
             steps=self.steps,
             num_assets=self.num_assets,
             sentiment_mode=self.sentiment_mode,
             sentiment_lag=self.sentiment_lag,
         )
-        _env = DreamEnv(_data, initial_balance=self.initial_balance)
+        _raw = DreamEnv(_data, initial_balance=self.initial_balance)
+
+        if vecnorm_path and os.path.exists(vecnorm_path):
+            _venv = DummyVecEnv([lambda: _raw])
+            _env  = VecNormalize.load(vecnorm_path, _venv)
+            _env.training = False
+            _env.norm_reward = False
+            print(f"VecNormalize loaded from {vecnorm_path}")
+        else:
+            _env = _raw
 
         print(f"Loading PPO model from {model_path} …")
         self.model = PPO.load(model_path, env=_env, device="cpu")
@@ -616,6 +629,7 @@ if __name__ == "__main__":
         steps=EVAL_STEPS,
         data_mode=DATA_MODE,
         csv_path=CSV_PATH,
+        vecnorm_path=VECNORM_PATH,
     )
     evaluator.run_monte_carlo()
     evaluator.plot_dashboard(output_img=OUTPUT_IMG)

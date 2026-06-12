@@ -6,29 +6,43 @@ from collections import deque
 
 class DreamEnv(gym.Env):
     """
-    D.R.E.A.M. Portfolio Management Environment (Phase 5).
+    D.R.E.A.M. Portfolio Management Environment — Phase 6.
 
-    Supports two sentiment modes, automatically detected from the data feed:
+    Architectural changes vs Phase 5
+    ---------------------------------
 
-    "macro"  (EmpiricalDataFeed or WyckoffMockData with sentiment_mode="macro")
-        Observation space: 3 + 3*N dimensions
-            [norm_balance, norm_portfolio, sentiment_macro,
-             z_ret_0, scaled_vol_0, norm_pos_0,
-             z_ret_1, scaled_vol_1, norm_pos_1, ...]
+    1. Action space: softmax + explicit cash slot
+       The policy emits N+1 logits (N assets + 1 cash).  Softmax converts
+       them to a valid probability distribution summing to 1.0 by
+       construction.  No dead zones or ad-hoc normalisation needed.
+       The cash logit weight stays as balance (not invested).
 
-    "per_asset"  (WyckoffMockData with sentiment_mode="per_asset")
-        Observation space: 2 + 4*N dimensions
-            [norm_balance, norm_portfolio,
-             z_ret_0, scaled_vol_0, sentiment_0, norm_pos_0,
-             z_ret_1, scaled_vol_1, sentiment_1, norm_pos_1, ...]
+    2. Observation space: current_weight replaces norm_pos
+       Each asset's weight (value / portfolio_value) replaces the old
+       norm_pos (value / initial_balance).  current_weight is
+       scale-invariant — stays in [0,1] regardless of portfolio drift.
+       cash_weight is added as an explicit global feature.
+       norm_balance is dropped (redundant given norm_portfolio + cash_weight).
 
-        Placing the per-asset sentiment adjacent to each asset's price signals
-        helps the MLP associate the sentiment directly with the corresponding
-        asset's dynamics, rather than forcing it to learn this association
-        across a globally shared slot.
+    3. Observation layout
+       macro mode    obs_dim = 3 + 3*N:
+           [norm_portfolio, cash_weight, sentiment_macro,
+            z_ret_0, scaled_vol_0, weight_0, ...]
 
-    All other mechanics (reward, trade execution, MDD tracking) are unchanged
-    from Phase 4.
+       per_asset mode  obs_dim = 2 + 4*N:
+           [norm_portfolio, cash_weight,
+            z_ret_0, scaled_vol_0, sentiment_0, weight_0, ...]
+
+    4. Dead zones removed
+       Softmax output is already a proper distribution; dead zones are
+       not needed and would distort the gradient signal.
+
+    5. REWARD_POSITIVE_BONUS removed (0.05 -> 0.0)
+       The discontinuous bonus contributed to critic collapse (ev ~= 0)
+       in macro-mode experiments.
+
+    6. REWARD_TURNOVER_COEF configurable via turnover_coef __init__ arg.
+       Recommended: 0.01 for per_asset, 0.03 for macro.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -36,53 +50,61 @@ class DreamEnv(gym.Env):
     # ------------------------------------------------------------------
     # Reward hyperparameters
     # ------------------------------------------------------------------
-    REWARD_VOL_SCALE: float    = 1.0
+    REWARD_VOL_SCALE: float     = 1.0
     REWARD_MDD_THRESHOLD: float = 0.10
-    REWARD_MDD_COEF: float     = 1.0
-    REWARD_TURNOVER_COEF: float = 0.05
-    REWARD_POSITIVE_BONUS: float = 0.05
-    VOL_ANN_FLOOR: float       = 0.05
+    REWARD_MDD_COEF: float      = 1.0
+    REWARD_TURNOVER_COEF: float = 0.02
+    VOL_ANN_FLOOR: float        = 0.05
 
     # ------------------------------------------------------------------
     # Observation normalisation
     # ------------------------------------------------------------------
-    OBS_RETURN_WINDOW: int  = 20
-    OBS_VOL_SCALE: float    = 0.5
+    OBS_RETURN_WINDOW: int = 20
+    OBS_VOL_SCALE: float   = 0.5
 
     # ------------------------------------------------------------------
     # Transaction mechanics
     # ------------------------------------------------------------------
-    COMMISSION_RATE: float       = 0.001
+    COMMISSION_RATE: float        = 0.001
     DELTA_WEIGHT_THRESHOLD: float = 0.02
-    DEAD_ZONE_LOW: float         = 0.05
-    DEAD_ZONE_HIGH: float        = 0.95
 
-    def __init__(self, data_generator, initial_balance: float = 10_000.0):
+    def __init__(
+        self,
+        data_generator,
+        initial_balance: float = 10_000.0,
+        turnover_coef: float | None = None,
+    ):
         """
         Args:
             data_generator: WyckoffMockData or EmpiricalDataFeed instance.
             initial_balance: Starting portfolio value in currency units.
+            turnover_coef:  Override for REWARD_TURNOVER_COEF.
+                            per_asset: 0.01 | macro: 0.03
         """
         super().__init__()
 
-        self.data_gen = data_generator
+        self.data_gen        = data_generator
         self.initial_balance = initial_balance
-        self.num_assets: int = getattr(self.data_gen, "num_assets", 1)
-        self.max_steps: int = self.data_gen.steps - 1
+        if turnover_coef is not None:
+            self.REWARD_TURNOVER_COEF = turnover_coef
 
-        # Detect sentiment mode from the data feed
+        self.num_assets: int = getattr(self.data_gen, "num_assets", 1)
+        self.max_steps: int  = self.data_gen.steps - 1
+
         self.sentiment_mode: str = getattr(
             self.data_gen, "sentiment_mode", "macro"
         )
 
-        # ---- Action space ------------------------------------------------
+        # ---- Action space: N assets + 1 cash logits ---------------------
         self.action_space = spaces.Box(
-            low=-1.0, high=1.0, shape=(self.num_assets,), dtype=np.float32
+            low=-10.0, high=10.0,
+            shape=(self.num_assets + 1,),
+            dtype=np.float32,
         )
 
-        # ---- Observation space -------------------------------------------
-        # macro:     3 + 3*N  (one shared sentiment slot)
-        # per_asset: 2 + 4*N  (one sentiment slot per asset, inside its block)
+        # ---- Observation space ------------------------------------------
+        # macro:     3 + 3*N
+        # per_asset: 2 + 4*N
         if self.sentiment_mode == "macro":
             obs_dim = 3 + 3 * self.num_assets
         else:
@@ -90,19 +112,18 @@ class DreamEnv(gym.Env):
 
         low  = np.full(obs_dim, -np.inf, dtype=np.float32)
         high = np.full(obs_dim,  np.inf, dtype=np.float32)
-        low[0] = 0.0   # norm_balance  >= 0
-        low[1] = 0.0   # norm_portfolio >= 0
+        low[0] = 0.0   # norm_portfolio >= 0
+        low[1] = 0.0   # cash_weight    >= 0
         self.observation_space = spaces.Box(low=low, high=high, dtype=np.float32)
 
-        # ---- Accounting state --------------------------------------------
-        self.current_step: int = 0
-        self.balance: float = initial_balance
-        self.position_sizes: np.ndarray = np.zeros(self.num_assets, dtype=np.float32)
-        self.portfolio_value: float = initial_balance
+        # ---- Accounting state -------------------------------------------
+        self.current_step: int           = 0
+        self.balance: float              = initial_balance
+        self.position_sizes: np.ndarray  = np.zeros(self.num_assets, dtype=np.float32)
+        self.portfolio_value: float      = initial_balance
         self.peak_portfolio_value: float = initial_balance
-        self.current_mdd: float = 0.0
-
-        self._return_history: deque = deque(maxlen=self.OBS_RETURN_WINDOW)
+        self.current_mdd: float          = 0.0
+        self._return_history: deque      = deque(maxlen=self.OBS_RETURN_WINDOW)
 
         self.reset()
 
@@ -125,12 +146,12 @@ class DreamEnv(gym.Env):
             else self.data_gen.steps - 1
         )
 
-        self.current_step = 0
-        self.balance = self.initial_balance
-        self.position_sizes = np.zeros(self.num_assets, dtype=np.float32)
-        self.portfolio_value = self.initial_balance
+        self.current_step         = 0
+        self.balance              = self.initial_balance
+        self.position_sizes       = np.zeros(self.num_assets, dtype=np.float32)
+        self.portfolio_value      = self.initial_balance
         self.peak_portfolio_value = self.initial_balance
-        self.current_mdd = 0.0
+        self.current_mdd          = 0.0
         self._return_history.clear()
 
         return self._get_observation(), {}
@@ -141,19 +162,18 @@ class DreamEnv(gym.Env):
         """
         Executes one trading step.
 
-        Pipeline:
-            1. Map raw action → target weights (dead-zone + no-leverage).
-            2. Snapshot portfolio value before trades.
-            3. Execute sells, then buys.
-            4. Mark to market; update peak and MDD.
-            5. Compute reward.
-            6. Advance step counter.
+        1. Softmax(action) -> target weights for N assets (cash implicit).
+        2. Snapshot portfolio value before trades.
+        3. Execute sells, then buys.
+        4. Mark to market; update peak and MDD.
+        5. Compute reward.
+        6. Advance step counter.
         """
         prices, log_returns, sentiment, volatility = self.data_gen.get_step_data(
             self.current_step
         )
 
-        # 1. Weights
+        # 1. Target weights via softmax
         target_weights = self._action_to_weights(action)
 
         # 2. Pre-trade snapshot
@@ -184,19 +204,12 @@ class DreamEnv(gym.Env):
         # 5. Reward
         step_return = (
             (self.portfolio_value - prev_portfolio_value) / prev_portfolio_value
-            if prev_portfolio_value > 0
-            else 0.0
-        )
-        exposure_ratios = (
-            (self.position_sizes * prices) / self.portfolio_value
-            if self.portfolio_value > 0
-            else np.zeros(self.num_assets, dtype=np.float32)
+            if prev_portfolio_value > 0 else 0.0
         )
         reward = self._compute_reward(
             step_return=step_return,
             volatility=volatility,
             delta_weights=delta_weights,
-            exposure_ratios=exposure_ratios,
         )
 
         # 6. Advance
@@ -205,8 +218,8 @@ class DreamEnv(gym.Env):
 
         info = {
             "portfolio_value": self.portfolio_value,
-            "mdd": self.current_mdd,
-            "step_return": step_return,
+            "mdd":             self.current_mdd,
+            "step_return":     step_return,
             "tickers": (
                 self.data_gen.current_tickers
                 if hasattr(self.data_gen, "current_tickers")
@@ -221,20 +234,13 @@ class DreamEnv(gym.Env):
 
     def _get_observation(self) -> np.ndarray:
         """
-        Builds the flat observation vector.
-
         macro mode  (obs_dim = 3 + 3*N):
-            [norm_balance, norm_portfolio, sentiment_macro,
-             z_ret_0, scaled_vol_0, norm_pos_0, ...]
+            [norm_portfolio, cash_weight, sentiment_macro,
+             z_ret_0, scaled_vol_0, weight_0, ...]
 
         per_asset mode  (obs_dim = 2 + 4*N):
-            [norm_balance, norm_portfolio,
-             z_ret_0, scaled_vol_0, sentiment_0, norm_pos_0,
-             z_ret_1, scaled_vol_1, sentiment_1, norm_pos_1, ...]
-
-        Placing per-asset sentiment inside each asset's feature block
-        (rather than in a separate global section) keeps spatially related
-        features contiguous, which aids learning in shallow MLPs.
+            [norm_portfolio, cash_weight,
+             z_ret_0, scaled_vol_0, sentiment_0, weight_0, ...]
         """
         prices, log_returns, sentiment, volatility = self.data_gen.get_step_data(
             self.current_step
@@ -250,40 +256,41 @@ class DreamEnv(gym.Env):
         else:
             z_log_returns = np.zeros(self.num_assets, dtype=np.float32)
 
-        scaled_vol  = np.clip(volatility / self.OBS_VOL_SCALE, 0.0, 4.0)
-        norm_balance    = self.balance / self.initial_balance
-        norm_portfolio  = self.portfolio_value / self.initial_balance
+        scaled_vol     = np.clip(volatility / self.OBS_VOL_SCALE, 0.0, 4.0)
+        norm_portfolio = self.portfolio_value / self.initial_balance
+        cash_weight    = (
+            self.balance / self.portfolio_value
+            if self.portfolio_value > 0 else 1.0
+        )
+
+        # Scale-invariant asset weights
+        if self.portfolio_value > 0:
+            asset_weights = (self.position_sizes * prices) / self.portfolio_value
+        else:
+            asset_weights = np.zeros(self.num_assets, dtype=np.float32)
 
         if self.sentiment_mode == "macro":
-            # sentiment is a float scalar
-            obs = [norm_balance, norm_portfolio, float(sentiment)]
+            obs = [norm_portfolio, cash_weight, float(sentiment)]
             for i in range(self.num_assets):
-                norm_pos = (
-                    self.position_sizes[i] * prices[i]
-                ) / self.initial_balance
-                obs.extend(
-                    [float(z_log_returns[i]), float(scaled_vol[i]), float(norm_pos)]
-                )
+                obs.extend([
+                    float(z_log_returns[i]),
+                    float(scaled_vol[i]),
+                    float(asset_weights[i]),
+                ])
         else:
-            # sentiment is np.ndarray of shape (num_assets,)
-            obs = [norm_balance, norm_portfolio]
+            obs = [norm_portfolio, cash_weight]
             for i in range(self.num_assets):
-                norm_pos = (
-                    self.position_sizes[i] * prices[i]
-                ) / self.initial_balance
-                obs.extend(
-                    [
-                        float(z_log_returns[i]),
-                        float(scaled_vol[i]),
-                        float(sentiment[i]),
-                        float(norm_pos),
-                    ]
-                )
+                obs.extend([
+                    float(z_log_returns[i]),
+                    float(scaled_vol[i]),
+                    float(sentiment[i]),
+                    float(asset_weights[i]),
+                ])
 
         return np.array(obs, dtype=np.float32)
 
     # ------------------------------------------------------------------
-    # Reward computation
+    # Reward
     # ------------------------------------------------------------------
 
     def _compute_reward(
@@ -291,16 +298,11 @@ class DreamEnv(gym.Env):
         step_return: float,
         volatility: np.ndarray,
         delta_weights: np.ndarray,
-        exposure_ratios: np.ndarray,
     ) -> float:
         """
-        Scalar reward for a single trading step.
-
-        Components:
-            base_reward      = (step_return / daily_vol) * REWARD_VOL_SCALE
-            drawdown_penalty = current_mdd * REWARD_MDD_COEF  (if > threshold)
-            turnover_penalty = REWARD_TURNOVER_COEF * Σ|Δw|
-            positive_bonus   = REWARD_POSITIVE_BONUS  (if profitable & exposed)
+        base_reward      = (step_return / daily_vol) * REWARD_VOL_SCALE
+        drawdown_penalty = current_mdd * REWARD_MDD_COEF  (if MDD > threshold)
+        turnover_penalty = REWARD_TURNOVER_COEF * sum(|delta_w_i|)
         """
         ann_vol   = max(float(np.mean(volatility)), self.VOL_ANN_FLOOR)
         daily_vol = ann_vol / np.sqrt(252)
@@ -311,29 +313,34 @@ class DreamEnv(gym.Env):
 
         reward -= self.REWARD_TURNOVER_COEF * float(np.sum(np.abs(delta_weights)))
 
-        if step_return > 0.0 and float(np.sum(exposure_ratios)) > 0.1:
-            reward += self.REWARD_POSITIVE_BONUS
-
         return float(reward)
 
     # ------------------------------------------------------------------
-    # Trade execution helpers
+    # Action -> weights (softmax)
     # ------------------------------------------------------------------
 
     def _action_to_weights(self, action: np.ndarray) -> np.ndarray:
         """
-        Maps raw policy actions in [-1, 1]^N to valid weights in [0, 1]^N.
+        Converts N+1 raw logits to N asset weights via softmax.
 
-        Steps:
-            1. Linear rescaling [-1, 1] → [0, 1].
-            2. Dead-zone snapping.
-            3. Sum normalisation to enforce no-leverage constraint.
+        The last logit is the cash slot.  After softmax, the first N
+        probabilities are the asset weights; the agent holds
+        (1 - sum(asset_weights)) as uninvested balance.
+
+        Softmax guarantees:
+          - all weights in (0, 1)
+          - sum of all N+1 probabilities = 1.0
+          - asset weights sum to (1 - cash_prob) <= 1.0
+          - smooth differentiable gradients throughout
         """
-        w = (action + 1.0) / 2.0
-        w = np.where(w < self.DEAD_ZONE_LOW,  0.0, w)
-        w = np.where(w > self.DEAD_ZONE_HIGH, 1.0, w)
-        s = w.sum()
-        return w / s if s > 1.0 else w
+        shifted = action - np.max(action)   # numerical stability
+        e       = np.exp(shifted)
+        probs   = e / e.sum()               # shape: (num_assets + 1,)
+        return probs[:self.num_assets].astype(np.float32)
+
+    # ------------------------------------------------------------------
+    # Trade execution
+    # ------------------------------------------------------------------
 
     def _execute_sells(
         self,
@@ -341,7 +348,6 @@ class DreamEnv(gym.Env):
         delta_weights: np.ndarray,
         prev_portfolio_value: float,
     ) -> None:
-        """Processes sell orders (assets whose target weight decreased)."""
         for i in range(self.num_assets):
             if delta_weights[i] < -self.DELTA_WEIGHT_THRESHOLD:
                 units = min(
@@ -358,7 +364,6 @@ class DreamEnv(gym.Env):
         delta_weights: np.ndarray,
         prev_portfolio_value: float,
     ) -> None:
-        """Processes buy orders (assets whose target weight increased)."""
         for i in range(self.num_assets):
             if delta_weights[i] > self.DELTA_WEIGHT_THRESHOLD:
                 invest = min(

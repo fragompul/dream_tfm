@@ -1,43 +1,50 @@
 """
-D.R.E.A.M. Reinforcement Learning Training Pipeline — Phase 5
+D.R.E.A.M. Reinforcement Learning Training Pipeline — Phase 6
 
-Key changes from Phase 4:
-    - SENTIMENT_MODE parameter selects "macro" or "per_asset" data generation.
-    - SENTIMENT_LAG controls how many steps per-asset sentiment leads price.
-    - Observation space dimension is set automatically by DreamEnv based on
-      the sentiment mode detected from the data feed.
-    - TOTAL_TIMESTEPS reduced for synthetic experiments (500k is enough to
-      validate convergence; empirical experiments can be run longer).
-    - ent_coef reduced from 0.02 → 0.005 to prevent the std blow-up observed
-      in Phase 4 long runs.
-    - Linear learning rate decay added: starts at LR_INITIAL and decays to
-      LR_FINAL over the training budget, preventing late-stage std drift.
+Changes vs Phase 5
+------------------
+1. Separate actor/critic networks (net_arch=dict(pi=..., vf=...))
+   In Phase 5 the policy used shared base layers, meaning the critic's
+   noisy gradients contaminated the actor.  Separate networks allow each
+   head to specialise independently.  This is the most likely cause of
+   the ev ~= 0 collapse observed in macro-mode experiments.
+
+2. VecNormalize for reward normalisation
+   Enabled for synthetic training only.
+   Controlled by USE_VECNORM flag.
+   Set True for synthetic (high reward variance across Wyckoff regimes).
+   Set False for empirical fine-tuning: with a small dataset the
+   running reward stats converge to near-zero std, normalising every
+   reward to ~0 and causing the policy to collapse to all-cash.
+
+3. B&H baseline adapted for N+1 softmax action space
+   The equal-weight static action now emits N+1 logits where the first
+   N are equal and the cash logit is set to a low value, so softmax
+   produces approximately equal asset weights with minimal cash.
+
+4. Action space changed from Box([-1,1]^N) to Box([-inf,inf]^(N+1))
+   Matches the new DreamEnv Phase 6 softmax action space.
 
 Experiment guide
 ----------------
 Exp 1 — Pipeline sanity check:
-    DATA_MODE      = "synthetic"
-    SENTIMENT_MODE = "macro"
-    NUM_ASSETS     = 2
-    TOTAL_TIMESTEPS = 300_000
+    DATA_MODE = "synthetic", SENTIMENT_MODE = "macro"
+    NUM_ASSETS = 2, TOTAL_TIMESTEPS = 300_000, TURNOVER_COEF = 0.03
 
 Exp 2 — Per-asset signal learning:
-    DATA_MODE      = "synthetic"
-    SENTIMENT_MODE = "per_asset"
-    NUM_ASSETS     = 3
-    TOTAL_TIMESTEPS = 700_000
+    DATA_MODE = "synthetic", SENTIMENT_MODE = "per_asset"
+    NUM_ASSETS = 3, TOTAL_TIMESTEPS = 700_000, TURNOVER_COEF = 0.01
 
 Exp 3 — Macro-only (simulates real-data conditions):
-    DATA_MODE      = "synthetic"
-    SENTIMENT_MODE = "macro"
-    NUM_ASSETS     = 3
-    TOTAL_TIMESTEPS = 700_000
+    DATA_MODE = "synthetic", SENTIMENT_MODE = "macro"
+    NUM_ASSETS = 3, TOTAL_TIMESTEPS = 700_000, TURNOVER_COEF = 0.03
 
-Exp 4 — Real data transfer (eval only, or fine-tune from Exp 3 checkpoint):
-    DATA_MODE      = "empirical"
-    SENTIMENT_MODE = "macro"   (EmpiricalDataFeed is always macro)
-    NUM_ASSETS     = 3
-    TOTAL_TIMESTEPS = 300_000  (fine-tune budget)
+Exp 4 — Real data transfer (fine-tune from Exp 3 checkpoint):
+    DATA_MODE = "empirical", SENTIMENT_MODE = "macro"
+    NUM_ASSETS = 3, TOTAL_TIMESTEPS = 500_000, TURNOVER_COEF = 0.03
+    FINETUNE_FROM = "test_modelos/dream_synthetic_macro_N3_v6.zip"
+    USE_VECNORM = False, RESET_VECNORM = True
+    LR_INITIAL = 1e-4, LR_FINAL = 2e-5
 """
 
 import os
@@ -47,48 +54,78 @@ import numpy as np
 from stable_baselines3 import PPO
 from stable_baselines3.common.env_checker import check_env
 from stable_baselines3.common.callbacks import BaseCallback
+from stable_baselines3.common.vec_env import DummyVecEnv, VecNormalize
+from stable_baselines3.common.monitor import Monitor
 
 from src.agent.data_feed import WyckoffMockData, EmpiricalDataFeed
 from src.agent.dream_env import DreamEnv
 from src.agent.config import RANDOM_SEED
 
 # =============================================================================
-# Training configuration — edit these for each experiment
+# Training configuration
 # =============================================================================
 
-DATA_MODE: str      = "empirical"    # "synthetic" | "empirical"
-SENTIMENT_MODE: str = "macro"    # "macro"     | "per_asset"
-SENTIMENT_LAG: int  = 2              # steps sentiment leads price (per_asset)
+DATA_MODE: str      = "empirical"
+SENTIMENT_MODE: str = "macro"
+SENTIMENT_LAG: int  = 2
 NUM_ASSETS: int     = 3
-EPISODE_STEPS: int  = 512
-TOTAL_TIMESTEPS: int = 300_000
+EPISODE_STEPS: int  = 252          # empirical: 252 | synthetic: 1000
+TOTAL_TIMESTEPS: int = 250_000
 
-# Fine-tune from an existing checkpoint? Set path or None.
-FINETUNE_FROM: str | None = "test_modelos/dream_synthetic_macro_N3_v5.zip"   # e.g. "test_modelos/checkpoints/checkpoint_700_000.zip"
+TURNOVER_COEF: float = 0.03   # per_asset: 0.01 | macro: 0.03
 
-# Learning rate schedule: linear decay from LR_INITIAL → LR_FINAL
-LR_INITIAL: float = 2e-4
-LR_FINAL:   float = 4e-5
+FINETUNE_FROM: str | None = "test_modelos/dream_synthetic_macro_N3_v6.zip"
+
+# When fine-tuning from a synthetic checkpoint into empirical data,
+# the VecNormalize running stats from synthetic training are incompatible
+# with the empirical reward scale and must be reset.
+# True  — reset stats (use when crossing synthetic -> empirical boundary)
+# False — keep stats (use when continuing empirical from empirical checkpoint)
+# Controls whether VecNormalize reward normalisation is applied.
+# True  — recommended for synthetic training (high reward variance).
+# False — recommended for empirical fine-tuning (stable reward scale;
+#         running stats converge to near-zero std and collapse policy).
+USE_VECNORM: bool = False   # synthetic: True | empirical: False
+RESET_VECNORM: bool = True
+
+# Path to saved VecNormalize stats (.pkl) to load when RESET_VECNORM=False.
+# Use when continuing an empirical run from an empirical checkpoint so
+# the normaliser resumes with the accumulated stats from that run.
+# Set to None when RESET_VECNORM=True (stats will be reset anyway).
+VECNORM_PATH: str | None = None   # e.g. "test_modelos/dream_empirical_macro_N3_v6_vecnorm.pkl"
+
+LR_INITIAL: float = 5e-5
+LR_FINAL:   float = 1e-5
+# LR_INITIAL: float = 2e-4
+# LR_FINAL:   float = 4e-5
+
 
 def _linear_lr_schedule(initial: float, final: float):
-    """Returns a callable that linearly decays from initial to final."""
     def schedule(progress_remaining: float) -> float:
-        # progress_remaining: 1.0 at start → 0.0 at end
         return final + (initial - final) * progress_remaining
     return schedule
 
 
 PPO_HYPERPARAMETERS: dict = {
     "learning_rate": _linear_lr_schedule(LR_INITIAL, LR_FINAL),
-    "n_steps":       1024,
-    "batch_size":    128,
+    "n_steps":       2048,      # empirical: 2048 | synthetic: 2000
+    "batch_size":    256,       # empirical: 256  | synthetic: 200
     "n_epochs":      10,
     "gamma":         0.98,
     "gae_lambda":    0.95,
     "clip_range":    0.20,
-    "ent_coef":      0.005,   # ↓ from 0.02 — prevents std blow-up in long runs
+    "ent_coef":      0.005,
     "vf_coef":       0.5,
     "max_grad_norm": 0.5,
+    # Separate actor and critic networks.
+    # Prevents noisy critic gradients from contaminating the actor,
+    # which was a likely cause of ev ~= 0 in macro-mode experiments.
+    "policy_kwargs": dict(
+        net_arch=dict(
+            pi=[256, 256],   # actor
+            vf=[256, 256],   # critic
+        )
+    ),
 }
 
 # =============================================================================
@@ -129,11 +166,6 @@ def setup_logging(log_dir: str) -> str:
 # =============================================================================
 
 class CheckpointAndLogCallback(BaseCallback):
-    """
-    Saves checkpoints every save_every_steps and prints a one-line summary
-    every log_every_iterations rollout updates.
-    """
-
     def __init__(
         self,
         save_every_steps: int = 100_000,
@@ -157,7 +189,7 @@ class CheckpointAndLogCallback(BaseCallback):
                 f"checkpoint_{self.num_timesteps:_d}",
             )
             self.model.save(path)
-            print(f"\n  💾 Checkpoint → {path}.zip  ({self.num_timesteps:,} steps)\n")
+            print(f"\n  Checkpoint -> {path}.zip  ({self.num_timesteps:,} steps)\n")
             self._last_checkpoint_step = self.num_timesteps
         return True
 
@@ -193,10 +225,24 @@ class CheckpointAndLogCallback(BaseCallback):
 def evaluate_buy_and_hold_baseline(
     data_generator, initial_balance: float = 10_000.0, n_episodes: int = 20
 ) -> float:
-    env = DreamEnv(data_generator=data_generator, initial_balance=initial_balance)
-    num_assets   = env.num_assets
-    equal_weight = 1.0 / num_assets
-    static_action = np.full(num_assets, 2.0 * equal_weight - 1.0, dtype=np.float32)
+    """
+    Equal-weight B&H adapted for the N+1 softmax action space.
+
+    We emit N+1 logits where the first N are equal (value=2.0) and the
+    cash logit is low (value=-4.0).  After softmax this gives approximately
+    equal allocation to all assets with minimal cash.
+    """
+    env = DreamEnv(
+        data_generator=data_generator,
+        initial_balance=initial_balance,
+        turnover_coef=TURNOVER_COEF,
+    )
+    num_assets = env.num_assets
+
+    # N equal asset logits + 1 low cash logit
+    static_action = np.array(
+        [2.0] * num_assets + [-4.0], dtype=np.float32
+    )
 
     rewards = []
     for _ in range(n_episodes):
@@ -209,7 +255,7 @@ def evaluate_buy_and_hold_baseline(
         rewards.append(total)
 
     mean, std = float(np.mean(rewards)), float(np.std(rewards))
-    print(f"  B&H baseline — mean reward: {mean:.2f} ± {std:.2f}")
+    print(f"  B&H baseline — mean reward: {mean:.2f} +/- {std:.2f}")
     return mean
 
 # =============================================================================
@@ -225,12 +271,12 @@ def train_dream_agent() -> PPO:
     torch.manual_seed(RANDOM_SEED)
     if torch.cuda.is_available():
         torch.cuda.manual_seed_all(RANDOM_SEED)
-        
+
     log_dir  = "./test_modelos/logs"
     log_path = setup_logging(log_dir)
 
     print("=" * 70)
-    print("      D.R.E.A.M. RL PIPELINE — Phase 5")
+    print("      D.R.E.A.M. RL PIPELINE — Phase 6")
     print("=" * 70)
     print(f"  Data:      {DATA_MODE.upper()}")
     print(f"  Sentiment: {SENTIMENT_MODE}")
@@ -245,8 +291,6 @@ def train_dream_agent() -> PPO:
     # 1. Data feed
     # ------------------------------------------------------------------
     if DATA_MODE == "synthetic":
-        print(f"\nInitialising WyckoffMockData "
-              f"(mode={SENTIMENT_MODE}, lag={SENTIMENT_LAG}) …")
         data_generator = WyckoffMockData(
             steps=EPISODE_STEPS,
             num_assets=NUM_ASSETS,
@@ -255,7 +299,6 @@ def train_dream_agent() -> PPO:
         )
     elif DATA_MODE == "empirical":
         csv_path = "./data/train_agent_dataset.csv"
-        print(f"\nLoading empirical data from {csv_path} …")
         data_generator = EmpiricalDataFeed(
             csv_path=csv_path,
             steps=EPISODE_STEPS,
@@ -268,20 +311,51 @@ def train_dream_agent() -> PPO:
     # ------------------------------------------------------------------
     # 2. Baseline
     # ------------------------------------------------------------------
-    print("\nEvaluating B&H baseline (20 episodes) …")
+    print("\nEvaluating B&H baseline (20 episodes) ...")
     baseline_reward = evaluate_buy_and_hold_baseline(data_generator)
     print(f"  Baseline: {baseline_reward:.2f}")
 
     # ------------------------------------------------------------------
-    # 3. Environment check
+    # 3. Environment + VecNormalize
     # ------------------------------------------------------------------
-    env = DreamEnv(data_generator=data_generator)
-    print("\nRunning Gymnasium integrity check …")
-    check_env(env, warn=True)
+    # Monitor must wrap DreamEnv BEFORE VecNormalize so that episode
+    # rewards (ep_rew_mean) are recorded in the un-normalised scale and
+    # appear in TensorBoard and the compact callback log.
+    # Order: DreamEnv -> Monitor -> DummyVecEnv -> VecNormalize
+    def make_env():
+        env = DreamEnv(
+            data_generator=data_generator,
+            turnover_coef=TURNOVER_COEF,
+        )
+        return Monitor(env)
 
-    obs_dim = env.observation_space.shape[0]
-    print(f"  ✅ Passed.  obs_dim={obs_dim}  "
-          f"(mode={env.sentiment_mode})")
+    raw_env = DreamEnv(data_generator=data_generator, turnover_coef=TURNOVER_COEF)
+    print("\nRunning Gymnasium integrity check ...")
+    check_env(raw_env, warn=True)
+    obs_dim = raw_env.observation_space.shape[0]
+    act_dim = raw_env.action_space.shape[0]
+    print(f"  Passed.  obs_dim={obs_dim}  act_dim={act_dim}  "
+          f"(mode={raw_env.sentiment_mode})")
+
+    # VecNormalize: enabled for synthetic, disabled for empirical.
+    # Synthetic episodes vary widely in reward scale across Wyckoff
+    # regimes, so normalisation stabilises the critic.
+    # Empirical fine-tuning uses a small dataset: with enough steps
+    # the running reward std converges to near-zero, normalising every
+    # reward to ~0 and collapsing the policy to all-cash. Empirical
+    # reward is stable enough without normalisation.
+    venv = DummyVecEnv([make_env])
+    if USE_VECNORM:
+        venv = VecNormalize(
+            venv,
+            norm_obs=False,
+            norm_reward=True,
+            clip_reward=10.0,
+            gamma=PPO_HYPERPARAMETERS["gamma"],
+        )
+        print("  VecNormalize: enabled (synthetic mode)")
+    else:
+        print("  VecNormalize: disabled (empirical mode)")
 
     # ------------------------------------------------------------------
     # 4. Directories
@@ -294,36 +368,49 @@ def train_dream_agent() -> PPO:
     # ------------------------------------------------------------------
     # 5. PPO model
     # ------------------------------------------------------------------
-    print("\nBuilding PPO model …")
+    print("\nBuilding PPO model ...")
 
     if FINETUNE_FROM and os.path.exists(FINETUNE_FROM):
-        print(f"  Loading weights from checkpoint: {FINETUNE_FROM}")
+        # For synthetic fine-tune with RESET_VECNORM=False, optionally
+        # load saved VecNorm stats from a previous run.
+        if USE_VECNORM and not RESET_VECNORM:
+            if VECNORM_PATH and os.path.exists(VECNORM_PATH):
+                raw_venv = DummyVecEnv([make_env])
+                venv = VecNormalize.load(VECNORM_PATH, raw_venv)
+                venv.training = True
+                print(f"  VecNormalize stats loaded from {VECNORM_PATH}.")
+            else:
+                print("  VecNormalize stats retained (RESET_VECNORM=False).")
+
+        print(f"  Loading weights from: {FINETUNE_FROM}")
         model = PPO.load(
             FINETUNE_FROM,
-            env=env,
+            env=venv,
             device="cpu",
             custom_objects={
                 "learning_rate": PPO_HYPERPARAMETERS["learning_rate"],
                 "clip_range":    PPO_HYPERPARAMETERS["clip_range"],
             },
         )
-        # Override ent_coef for fine-tuning (avoid re-exploration explosion)
         model.ent_coef = PPO_HYPERPARAMETERS["ent_coef"]
     else:
         model = PPO(
             policy="MlpPolicy",
-            env=env,
+            env=venv,
             verbose=1,
             device="cpu",
-            tensorboard_log=log_dir,
             seed=RANDOM_SEED,
+            tensorboard_log=log_dir,
             **PPO_HYPERPARAMETERS,
         )
 
     print("\nHyperparameters:")
     for k, v in PPO_HYPERPARAMETERS.items():
-        val_str = f"{v:.6f}" if isinstance(v, float) else str(v)
-        print(f"    {k:<20} {val_str}")
+        if k == "policy_kwargs":
+            print(f"    {'policy_kwargs':<20} net_arch pi={v['net_arch']['pi']} vf={v['net_arch']['vf']}")
+        else:
+            val_str = f"{v:.6f}" if isinstance(v, float) else str(v)
+            print(f"    {k:<20} {val_str}")
 
     # ------------------------------------------------------------------
     # 6. Training
@@ -335,23 +422,25 @@ def train_dream_agent() -> PPO:
         baseline_reward=baseline_reward,
     )
 
-    print(f"\nStarting training ({TOTAL_TIMESTEPS:,} timesteps) …")
+    print(f"\nStarting training ({TOTAL_TIMESTEPS:,} timesteps) ...")
     print("-" * 70)
     model.learn(total_timesteps=TOTAL_TIMESTEPS, callback=callback)
     print("-" * 70)
 
     # ------------------------------------------------------------------
-    # 7. Save
+    # 7. Save model + VecNormalize stats
     # ------------------------------------------------------------------
-    model_name = (
-        f"dream_{DATA_MODE}_{SENTIMENT_MODE}_N{NUM_ASSETS}_v5"
-    )
-    save_path = os.path.join(model_dir, model_name)
+    model_name = f"dream_{DATA_MODE}_{SENTIMENT_MODE}_N{NUM_ASSETS}_v6"
+    save_path  = os.path.join(model_dir, model_name)
     model.save(save_path)
 
-    print(f"\nModel saved → {save_path}.zip")
-    print(f"Log         → {log_path}")
-    print("✅ Training complete.")
+    print(f"\nModel saved    -> {save_path}.zip")
+    if USE_VECNORM:
+        vecnorm_path = os.path.join(model_dir, f"{model_name}_vecnorm.pkl")
+        venv.save(vecnorm_path)
+        print(f"VecNorm saved  -> {vecnorm_path}")
+    print(f"Log            -> {log_path}")
+    print("Training complete.")
     print("=" * 70)
 
     return model
