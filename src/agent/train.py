@@ -65,16 +65,16 @@ from src.agent.config import RANDOM_SEED
 # Training configuration
 # =============================================================================
 
-DATA_MODE: str      = "empirical"
-SENTIMENT_MODE: str = "macro"
+DATA_MODE: str      = "synthetic"
+SENTIMENT_MODE: str = "per_asset"
 SENTIMENT_LAG: int  = 2
 NUM_ASSETS: int     = 3
-EPISODE_STEPS: int  = 252          # empirical: 252 | synthetic: 1000
-TOTAL_TIMESTEPS: int = 250_000
+EPISODE_STEPS: int  = 1000          # empirical: 252 | synthetic: 1000
+TOTAL_TIMESTEPS: int = 700_000
 
-TURNOVER_COEF: float = 0.03   # per_asset: 0.01 | macro: 0.03
+TURNOVER_COEF: float = 0.01   # per_asset: 0.01 | macro: 0.03
 
-FINETUNE_FROM: str | None = "test_modelos/dream_synthetic_macro_N3_v6.zip"
+FINETUNE_FROM: str | None = None # "test_modelos/dream_synthetic_macro_N3_v6.zip"
 
 # When fine-tuning from a synthetic checkpoint into empirical data,
 # the VecNormalize running stats from synthetic training are incompatible
@@ -85,7 +85,7 @@ FINETUNE_FROM: str | None = "test_modelos/dream_synthetic_macro_N3_v6.zip"
 # True  — recommended for synthetic training (high reward variance).
 # False — recommended for empirical fine-tuning (stable reward scale;
 #         running stats converge to near-zero std and collapse policy).
-USE_VECNORM: bool = False   # synthetic: True | empirical: False
+USE_VECNORM: bool = True   # synthetic: True | empirical: False
 RESET_VECNORM: bool = True
 
 # Path to saved VecNormalize stats (.pkl) to load when RESET_VECNORM=False.
@@ -94,10 +94,10 @@ RESET_VECNORM: bool = True
 # Set to None when RESET_VECNORM=True (stats will be reset anyway).
 VECNORM_PATH: str | None = None   # e.g. "test_modelos/dream_empirical_macro_N3_v6_vecnorm.pkl"
 
-LR_INITIAL: float = 5e-5
-LR_FINAL:   float = 1e-5
-# LR_INITIAL: float = 2e-4
-# LR_FINAL:   float = 4e-5
+# LR_INITIAL: float = 5e-5
+# LR_FINAL:   float = 1e-5
+LR_INITIAL: float = 2e-4
+LR_FINAL:   float = 4e-5
 
 
 def _linear_lr_schedule(initial: float, final: float):

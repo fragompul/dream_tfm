@@ -43,6 +43,18 @@ class DreamEnv(gym.Env):
 
     6. REWARD_TURNOVER_COEF configurable via turnover_coef __init__ arg.
        Recommended: 0.01 for per_asset, 0.03 for macro.
+
+    7. Reward: Information Ratio vs equal-weight benchmark
+       The base reward is now:
+           (step_return - bh_step_return) / daily_vol
+       where bh_step_return = mean(log_returns) is the return of the
+       equal-weight buy-and-hold benchmark on that step.
+       This makes the reward zero-centred around the benchmark:
+         - Beating B&H  -> positive reward
+         - Matching B&H -> zero reward
+         - Cash when market rises -> negative reward (opportunity cost)
+       This eliminates the reward ceiling at 0 that caused the agent
+       to converge to all-cash in empirical fine-tuning.
     """
 
     metadata = {"render_modes": ["human"]}
@@ -208,6 +220,7 @@ class DreamEnv(gym.Env):
         )
         reward = self._compute_reward(
             step_return=step_return,
+            log_returns=log_returns,
             volatility=volatility,
             delta_weights=delta_weights,
         )
@@ -296,17 +309,30 @@ class DreamEnv(gym.Env):
     def _compute_reward(
         self,
         step_return: float,
+        log_returns: np.ndarray,
         volatility: np.ndarray,
         delta_weights: np.ndarray,
     ) -> float:
         """
-        base_reward      = (step_return / daily_vol) * REWARD_VOL_SCALE
+        Information Ratio vs equal-weight benchmark.
+
+        base_reward      = ((step_return - bh_step_return) / daily_vol)
+                           * REWARD_VOL_SCALE
+        bh_step_return   = mean(log_returns)  — equal-weight B&H return
         drawdown_penalty = current_mdd * REWARD_MDD_COEF  (if MDD > threshold)
         turnover_penalty = REWARD_TURNOVER_COEF * sum(|delta_w_i|)
+
+        The benchmark term makes the reward zero-centred:
+          - Outperforming B&H  -> positive reward
+          - Matching B&H       -> zero reward
+          - Cash when mkt rises -> negative reward (opportunity cost)
         """
-        ann_vol   = max(float(np.mean(volatility)), self.VOL_ANN_FLOOR)
-        daily_vol = ann_vol / np.sqrt(252)
-        reward    = (step_return / daily_vol) * self.REWARD_VOL_SCALE
+        ann_vol         = max(float(np.mean(volatility)), self.VOL_ANN_FLOOR)
+        daily_vol       = ann_vol / np.sqrt(252)
+        bh_step_return  = float(np.mean(log_returns))
+        reward          = (
+            (step_return - bh_step_return) / daily_vol
+        ) * self.REWARD_VOL_SCALE
 
         if self.current_mdd > self.REWARD_MDD_THRESHOLD:
             reward -= self.current_mdd * self.REWARD_MDD_COEF

@@ -46,16 +46,16 @@ from src.agent.config import RANDOM_SEED
 # Evaluation configuration — edit these to match the experiment being evaluated
 # =============================================================================
 
-MODEL_PATH   = "test_modelos/dream_empirical_macro_N3_v6.zip"
-VECNORM_PATH = "test_modelos/dream_empirical_macro_N3_v6_vecnorm.pkl"
+MODEL_PATH   = "test_modelos/dream_synthetic_per_asset_N3_v6.zip"
+VECNORM_PATH = "test_modelos/dream_synthetic_per_asset_N3_v6_vecnorm.pkl"
 NUM_ASSETS = 3
-SENTIMENT_MODE:  str = "macro"   # "macro" | "per_asset"
+SENTIMENT_MODE:  str = "per_asset"   # "macro" | "per_asset"
 SENTIMENT_LAG:   int = 2
 NUM_RUNS:        int = 30
 EVAL_STEPS:      int = 1000
-DATA_MODE:       str = "empirical"   # "synthetic" | "empirical"
+DATA_MODE:       str = "synthetic"   # "synthetic" | "empirical"
 CSV_PATH:        str = "data/backtest_agent_dataset.csv"
-OUTPUT_IMG:      str = "test_modelos/eval_exp4_empirical_N3_v6.png"
+OUTPUT_IMG:      str = "test_modelos/eval_exp2_per_asset_N3_v6.png"
 
 # Experiment guide (Phase 6 — v6 models)
 # ------------------------------------------
