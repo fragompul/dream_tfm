@@ -44,7 +44,7 @@ class WyckoffMockData:
         steps: int = 252,
         num_assets: int = 1,
         sentiment_mode: str = "macro",
-        sentiment_lag: int = 2,
+        sentiment_lag: int = 1,
     ):
         """
         Args:
@@ -273,7 +273,9 @@ class WyckoffMockData:
             [self._raw_sentiment_for_state(int(s)) for s in phase_seq],
             dtype=np.float32,
         )
-        return macro
+        leading = np.roll(macro, -self.sentiment_lag)
+        leading[-self.sentiment_lag:] = leading[-(self.sentiment_lag + 1)]  # evitar wrap-around artefacts
+        return leading
 
     def _generate_per_asset_sentiment(self, asset_phase_seqs: list) -> np.ndarray:
         """

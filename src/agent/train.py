@@ -39,12 +39,12 @@ Exp 3 — Macro-only (simulates real-data conditions):
     DATA_MODE = "synthetic", SENTIMENT_MODE = "macro"
     NUM_ASSETS = 3, TOTAL_TIMESTEPS = 700_000, TURNOVER_COEF = 0.03
 
-Exp 4 — Real data transfer (fine-tune from Exp 3 checkpoint):
+Exp 4 — Real data transfer (fine-tune from Exp 3 or from scratch):
     DATA_MODE = "empirical", SENTIMENT_MODE = "macro"
-    NUM_ASSETS = 3, TOTAL_TIMESTEPS = 500_000, TURNOVER_COEF = 0.03
-    FINETUNE_FROM = "test_modelos/dream_synthetic_macro_N3_v6.zip"
-    USE_VECNORM = False, RESET_VECNORM = True
-    LR_INITIAL = 1e-4, LR_FINAL = 2e-5
+    NUM_ASSETS = 3, TOTAL_TIMESTEPS = 500_000, TURNOVER_COEF = 0.01
+    CASH_PENALTY = 0.1, MIN_EXPOSURE = 0.5
+    USE_VECNORM = False, EPISODE_STEPS = 126
+    LR_INITIAL = 3e-4, LR_FINAL = 3e-5
 """
 
 import os
@@ -65,16 +65,18 @@ from src.agent.config import RANDOM_SEED
 # Training configuration
 # =============================================================================
 
-DATA_MODE: str      = "synthetic"
-SENTIMENT_MODE: str = "per_asset"
-SENTIMENT_LAG: int  = 2
+DATA_MODE: str      = "empirical"
+SENTIMENT_MODE: str = "macro"
+SENTIMENT_LAG: int  = 1
 NUM_ASSETS: int     = 3
-EPISODE_STEPS: int  = 1000          # empirical: 252 | synthetic: 1000
-TOTAL_TIMESTEPS: int = 700_000
+EPISODE_STEPS: int  = 126           # empirical: 126 | synthetic: 1000
+TOTAL_TIMESTEPS: int = 300_000      # finetune: 300_000 | train: 700_000
 
 TURNOVER_COEF: float = 0.01   # per_asset: 0.01 | macro: 0.03
+CASH_PENALTY:  float = 0.    # synthetic: 0.0  | empirical: 0.1
+MIN_EXPOSURE:  float = 0.    # minimum investment mandate (50%)
 
-FINETUNE_FROM: str | None = None # "test_modelos/dream_synthetic_macro_N3_v6.zip"
+FINETUNE_FROM: str | None = "test_modelos/dream_synthetic_macro_N3.zip" # "test_modelos/dream_synthetic_macro_N3.zip"
 
 # When fine-tuning from a synthetic checkpoint into empirical data,
 # the VecNormalize running stats from synthetic training are incompatible
@@ -85,7 +87,7 @@ FINETUNE_FROM: str | None = None # "test_modelos/dream_synthetic_macro_N3_v6.zip
 # True  — recommended for synthetic training (high reward variance).
 # False — recommended for empirical fine-tuning (stable reward scale;
 #         running stats converge to near-zero std and collapse policy).
-USE_VECNORM: bool = True   # synthetic: True | empirical: False
+USE_VECNORM: bool = False   # synthetic: True | empirical: False
 RESET_VECNORM: bool = True
 
 # Path to saved VecNormalize stats (.pkl) to load when RESET_VECNORM=False.
@@ -94,11 +96,8 @@ RESET_VECNORM: bool = True
 # Set to None when RESET_VECNORM=True (stats will be reset anyway).
 VECNORM_PATH: str | None = None   # e.g. "test_modelos/dream_empirical_macro_N3_v6_vecnorm.pkl"
 
-# LR_INITIAL: float = 5e-5
-# LR_FINAL:   float = 1e-5
-LR_INITIAL: float = 2e-4
-LR_FINAL:   float = 4e-5
-
+LR_INITIAL: float = 3e-4
+LR_FINAL:   float = 3e-5
 
 def _linear_lr_schedule(initial: float, final: float):
     def schedule(progress_remaining: float) -> float:
@@ -109,7 +108,7 @@ def _linear_lr_schedule(initial: float, final: float):
 PPO_HYPERPARAMETERS: dict = {
     "learning_rate": _linear_lr_schedule(LR_INITIAL, LR_FINAL),
     "n_steps":       2048,      # empirical: 2048 | synthetic: 2000
-    "batch_size":    256,       # empirical: 256  | synthetic: 200
+    "batch_size":    252,       # empirical: 252  | synthetic: 200
     "n_epochs":      10,
     "gamma":         0.98,
     "gae_lambda":    0.95,
@@ -236,6 +235,8 @@ def evaluate_buy_and_hold_baseline(
         data_generator=data_generator,
         initial_balance=initial_balance,
         turnover_coef=TURNOVER_COEF,
+        cash_penalty=CASH_PENALTY,
+        min_exposure=MIN_EXPOSURE,
     )
     num_assets = env.num_assets
 
@@ -285,6 +286,8 @@ def train_dream_agent() -> PPO:
     print(f"  Timesteps: {TOTAL_TIMESTEPS:,}")
     if FINETUNE_FROM:
         print(f"  Fine-tune: {FINETUNE_FROM}")
+    print(f"  Turnover:  {TURNOVER_COEF}")
+    print(f"  Cash pen:  {CASH_PENALTY} (min_exp={MIN_EXPOSURE})")
     print(f"  Log:       {log_path}")
 
     # ------------------------------------------------------------------
@@ -326,10 +329,17 @@ def train_dream_agent() -> PPO:
         env = DreamEnv(
             data_generator=data_generator,
             turnover_coef=TURNOVER_COEF,
+            cash_penalty=CASH_PENALTY,
+            min_exposure=MIN_EXPOSURE,
         )
         return Monitor(env)
 
-    raw_env = DreamEnv(data_generator=data_generator, turnover_coef=TURNOVER_COEF)
+    raw_env = DreamEnv(
+        data_generator=data_generator,
+        turnover_coef=TURNOVER_COEF,
+        cash_penalty=CASH_PENALTY,
+        min_exposure=MIN_EXPOSURE,
+    )
     print("\nRunning Gymnasium integrity check ...")
     check_env(raw_env, warn=True)
     obs_dim = raw_env.observation_space.shape[0]
@@ -430,7 +440,7 @@ def train_dream_agent() -> PPO:
     # ------------------------------------------------------------------
     # 7. Save model + VecNormalize stats
     # ------------------------------------------------------------------
-    model_name = f"dream_{DATA_MODE}_{SENTIMENT_MODE}_N{NUM_ASSETS}_v6"
+    model_name = f"dream_{DATA_MODE}_{SENTIMENT_MODE}_N{NUM_ASSETS}"
     save_path  = os.path.join(model_dir, model_name)
     model.save(save_path)
 

@@ -1,3 +1,65 @@
+"""
+D.R.E.A.M. Portfolio Management Environment.
+
+Gymnasium-compatible environment for multi-asset portfolio management using
+Deep Reinforcement Learning.  Integrates sentiment signals and volatility
+forecasts from upstream pipeline modules to support informed capital allocation.
+
+Architecture
+------------
+Action space:
+    Box([-10, 10], shape=(N+1,)) — N+1 logits mapped to portfolio weights
+    via softmax.  The first N outputs correspond to asset allocation weights;
+    the (N+1)-th output represents cash.  Softmax guarantees weights sum to
+    1.0 by construction, eliminating the need for ad-hoc normalisation or
+    dead zones.
+
+Observation space:
+    Depends on the sentiment mode detected from the data feed:
+
+    "macro" mode — obs_dim = 3 + 3*N:
+        [norm_portfolio, cash_weight, sentiment_macro,
+         z_ret_0, scaled_vol_0, weight_0,
+         z_ret_1, scaled_vol_1, weight_1, ...]
+
+    "per_asset" mode — obs_dim = 2 + 4*N:
+        [norm_portfolio, cash_weight,
+         z_ret_0, scaled_vol_0, sentiment_0, weight_0,
+         z_ret_1, scaled_vol_1, sentiment_1, weight_1, ...]
+
+    Each asset's current portfolio weight (value / portfolio_value) is used
+    instead of the absolute normalised position.  This is scale-invariant
+    and stays in [0, 1] regardless of how the portfolio grows or contracts.
+
+Reward function:
+    Information Ratio vs equal-weight benchmark.  The base reward measures
+    how much the agent outperforms (or underperforms) a passive equal-weight
+    buy-and-hold strategy on the same assets:
+
+        base = ((step_return - bh_return) / daily_vol) * scale
+
+    where bh_return = mean(log_returns) across the N assets in the episode.
+
+    This formulation is zero-centred around the benchmark:
+      - Beating B&H    → positive reward
+      - Matching B&H   → zero reward
+      - Cash when market rises → negative reward (explicit opportunity cost)
+
+    Additional components:
+      - MDD penalty:  -MDD_COEF * current_mdd  (if MDD > threshold)
+      - Turnover penalty:  -TURNOVER_COEF * sum(|delta_w_i|)
+      - Cash penalty:  -CASH_PENALTY * max(0, min_exposure - total_exposure)
+        Enforces a minimum investment mandate: the agent must maintain
+        at least `min_exposure` fraction of the portfolio invested.
+        This is an operational constraint standard in fund management,
+        not a strategy hint.
+
+Configurable parameters:
+    turnover_coef:  Override via __init__ (per_asset: 0.01, macro: 0.03).
+    cash_penalty:   Override via __init__ (0.0 = disabled).
+    min_exposure:   Override via __init__ (default 0.5 = 50% minimum).
+"""
+
 import numpy as np
 import gymnasium as gym
 from gymnasium import spaces
@@ -5,57 +67,6 @@ from collections import deque
 
 
 class DreamEnv(gym.Env):
-    """
-    D.R.E.A.M. Portfolio Management Environment — Phase 6.
-
-    Architectural changes vs Phase 5
-    ---------------------------------
-
-    1. Action space: softmax + explicit cash slot
-       The policy emits N+1 logits (N assets + 1 cash).  Softmax converts
-       them to a valid probability distribution summing to 1.0 by
-       construction.  No dead zones or ad-hoc normalisation needed.
-       The cash logit weight stays as balance (not invested).
-
-    2. Observation space: current_weight replaces norm_pos
-       Each asset's weight (value / portfolio_value) replaces the old
-       norm_pos (value / initial_balance).  current_weight is
-       scale-invariant — stays in [0,1] regardless of portfolio drift.
-       cash_weight is added as an explicit global feature.
-       norm_balance is dropped (redundant given norm_portfolio + cash_weight).
-
-    3. Observation layout
-       macro mode    obs_dim = 3 + 3*N:
-           [norm_portfolio, cash_weight, sentiment_macro,
-            z_ret_0, scaled_vol_0, weight_0, ...]
-
-       per_asset mode  obs_dim = 2 + 4*N:
-           [norm_portfolio, cash_weight,
-            z_ret_0, scaled_vol_0, sentiment_0, weight_0, ...]
-
-    4. Dead zones removed
-       Softmax output is already a proper distribution; dead zones are
-       not needed and would distort the gradient signal.
-
-    5. REWARD_POSITIVE_BONUS removed (0.05 -> 0.0)
-       The discontinuous bonus contributed to critic collapse (ev ~= 0)
-       in macro-mode experiments.
-
-    6. REWARD_TURNOVER_COEF configurable via turnover_coef __init__ arg.
-       Recommended: 0.01 for per_asset, 0.03 for macro.
-
-    7. Reward: Information Ratio vs equal-weight benchmark
-       The base reward is now:
-           (step_return - bh_step_return) / daily_vol
-       where bh_step_return = mean(log_returns) is the return of the
-       equal-weight buy-and-hold benchmark on that step.
-       This makes the reward zero-centred around the benchmark:
-         - Beating B&H  -> positive reward
-         - Matching B&H -> zero reward
-         - Cash when market rises -> negative reward (opportunity cost)
-       This eliminates the reward ceiling at 0 that caused the agent
-       to converge to all-cash in empirical fine-tuning.
-    """
 
     metadata = {"render_modes": ["human"]}
 
@@ -66,6 +77,8 @@ class DreamEnv(gym.Env):
     REWARD_MDD_THRESHOLD: float = 0.10
     REWARD_MDD_COEF: float      = 1.0
     REWARD_TURNOVER_COEF: float = 0.02
+    REWARD_CASH_PENALTY: float  = 0.0    # configurable; 0.1 recommended for empirical
+    REWARD_MIN_EXPOSURE: float  = 0.5    # threshold below which cash penalty activates
     VOL_ANN_FLOOR: float        = 0.05
 
     # ------------------------------------------------------------------
@@ -85,20 +98,32 @@ class DreamEnv(gym.Env):
         data_generator,
         initial_balance: float = 10_000.0,
         turnover_coef: float | None = None,
+        cash_penalty: float | None = None,
+        min_exposure: float | None = None,
     ):
         """
         Args:
-            data_generator: WyckoffMockData or EmpiricalDataFeed instance.
+            data_generator:  WyckoffMockData or EmpiricalDataFeed instance.
             initial_balance: Starting portfolio value in currency units.
-            turnover_coef:  Override for REWARD_TURNOVER_COEF.
-                            per_asset: 0.01 | macro: 0.03
+            turnover_coef:   Override for REWARD_TURNOVER_COEF.
+                             Recommended: 0.01 (per_asset) | 0.03 (macro).
+            cash_penalty:    Override for REWARD_CASH_PENALTY.
+                             Recommended: 0.0 (synthetic) | 0.1 (empirical).
+            min_exposure:    Override for REWARD_MIN_EXPOSURE.
+                             Minimum fraction of portfolio that must be invested
+                             before the cash penalty activates.  Default 0.5.
         """
         super().__init__()
 
         self.data_gen        = data_generator
         self.initial_balance = initial_balance
+
         if turnover_coef is not None:
             self.REWARD_TURNOVER_COEF = turnover_coef
+        if cash_penalty is not None:
+            self.REWARD_CASH_PENALTY = cash_penalty
+        if min_exposure is not None:
+            self.REWARD_MIN_EXPOSURE = min_exposure
 
         self.num_assets: int = getattr(self.data_gen, "num_assets", 1)
         self.max_steps: int  = self.data_gen.steps - 1
@@ -115,8 +140,6 @@ class DreamEnv(gym.Env):
         )
 
         # ---- Observation space ------------------------------------------
-        # macro:     3 + 3*N
-        # per_asset: 2 + 4*N
         if self.sentiment_mode == "macro":
             obs_dim = 3 + 3 * self.num_assets
         else:
@@ -149,7 +172,6 @@ class DreamEnv(gym.Env):
         options: dict | None = None,
     ) -> tuple[np.ndarray, dict]:
         super().reset(seed=seed)
-
         self.data_gen.generate_new_market()
 
         self.max_steps = (
@@ -171,16 +193,8 @@ class DreamEnv(gym.Env):
     def step(
         self, action: np.ndarray
     ) -> tuple[np.ndarray, float, bool, bool, dict]:
-        """
-        Executes one trading step.
+        """Execute one trading step: rebalance, mark-to-market, compute reward."""
 
-        1. Softmax(action) -> target weights for N assets (cash implicit).
-        2. Snapshot portfolio value before trades.
-        3. Execute sells, then buys.
-        4. Mark to market; update peak and MDD.
-        5. Compute reward.
-        6. Advance step counter.
-        """
         prices, log_returns, sentiment, volatility = self.data_gen.get_step_data(
             self.current_step
         )
@@ -198,7 +212,7 @@ class DreamEnv(gym.Env):
             current_weights = np.zeros(self.num_assets, dtype=np.float32)
         delta_weights = target_weights - current_weights
 
-        # 3. Trades
+        # 3. Trade execution (sells first to free cash for buys)
         self._execute_sells(prices, delta_weights, prev_portfolio_value)
         self._execute_buys(prices, delta_weights, prev_portfolio_value)
 
@@ -218,11 +232,17 @@ class DreamEnv(gym.Env):
             (self.portfolio_value - prev_portfolio_value) / prev_portfolio_value
             if prev_portfolio_value > 0 else 0.0
         )
+        exposure_ratios = (
+            (self.position_sizes * prices) / self.portfolio_value
+            if self.portfolio_value > 0
+            else np.zeros(self.num_assets, dtype=np.float32)
+        )
         reward = self._compute_reward(
             step_return=step_return,
             log_returns=log_returns,
             volatility=volatility,
             delta_weights=delta_weights,
+            exposure_ratios=exposure_ratios,
         )
 
         # 6. Advance
@@ -247,13 +267,10 @@ class DreamEnv(gym.Env):
 
     def _get_observation(self) -> np.ndarray:
         """
-        macro mode  (obs_dim = 3 + 3*N):
-            [norm_portfolio, cash_weight, sentiment_macro,
-             z_ret_0, scaled_vol_0, weight_0, ...]
+        Build the flat observation vector.
 
-        per_asset mode  (obs_dim = 2 + 4*N):
-            [norm_portfolio, cash_weight,
-             z_ret_0, scaled_vol_0, sentiment_0, weight_0, ...]
+        Uses scale-invariant features: portfolio weights instead of absolute
+        positions, and rolling z-scored returns to normalise across regimes.
         """
         prices, log_returns, sentiment, volatility = self.data_gen.get_step_data(
             self.current_step
@@ -276,7 +293,6 @@ class DreamEnv(gym.Env):
             if self.portfolio_value > 0 else 1.0
         )
 
-        # Scale-invariant asset weights
         if self.portfolio_value > 0:
             asset_weights = (self.position_sizes * prices) / self.portfolio_value
         else:
@@ -303,7 +319,7 @@ class DreamEnv(gym.Env):
         return np.array(obs, dtype=np.float32)
 
     # ------------------------------------------------------------------
-    # Reward
+    # Reward computation
     # ------------------------------------------------------------------
 
     def _compute_reward(
@@ -312,56 +328,66 @@ class DreamEnv(gym.Env):
         log_returns: np.ndarray,
         volatility: np.ndarray,
         delta_weights: np.ndarray,
+        exposure_ratios: np.ndarray,
     ) -> float:
         """
-        Information Ratio vs equal-weight benchmark.
+        Information Ratio vs equal-weight benchmark with operational constraints.
 
-        base_reward      = ((step_return - bh_step_return) / daily_vol)
-                           * REWARD_VOL_SCALE
-        bh_step_return   = mean(log_returns)  — equal-weight B&H return
-        drawdown_penalty = current_mdd * REWARD_MDD_COEF  (if MDD > threshold)
-        turnover_penalty = REWARD_TURNOVER_COEF * sum(|delta_w_i|)
+        Components:
+            base       = ((step_return - bh_return) / daily_vol) * scale
+            mdd_pen    = -MDD_COEF * current_mdd          (if MDD > threshold)
+            turn_pen   = -TURNOVER_COEF * sum(|delta_w|)
+            cash_pen   = -CASH_PENALTY * shortfall         (if exposure < min)
 
-        The benchmark term makes the reward zero-centred:
-          - Outperforming B&H  -> positive reward
-          - Matching B&H       -> zero reward
-          - Cash when mkt rises -> negative reward (opportunity cost)
+        The benchmark term (bh_return = mean of log_returns across assets)
+        makes the reward zero-centred: positive when outperforming, negative
+        when underperforming, and explicitly negative when holding cash while
+        the market rises.
+
+        The cash penalty enforces a minimum investment mandate — a standard
+        operational constraint in fund management.  It does not prescribe
+        which assets to hold, only that the agent must be invested above
+        the minimum threshold.
         """
-        ann_vol         = max(float(np.mean(volatility)), self.VOL_ANN_FLOOR)
-        daily_vol       = ann_vol / np.sqrt(252)
-        bh_step_return  = float(np.mean(log_returns))
-        reward          = (
+        ann_vol        = max(float(np.mean(volatility)), self.VOL_ANN_FLOOR)
+        daily_vol      = ann_vol / np.sqrt(252)
+        bh_step_return = float(np.mean(log_returns))
+
+        reward = (
             (step_return - bh_step_return) / daily_vol
         ) * self.REWARD_VOL_SCALE
 
+        # Drawdown penalty
         if self.current_mdd > self.REWARD_MDD_THRESHOLD:
             reward -= self.current_mdd * self.REWARD_MDD_COEF
 
+        # Turnover penalty
         reward -= self.REWARD_TURNOVER_COEF * float(np.sum(np.abs(delta_weights)))
+
+        # Cash penalty (minimum investment mandate)
+        if self.REWARD_CASH_PENALTY > 0:
+            total_exposure = float(np.sum(exposure_ratios))
+            shortfall = max(0.0, self.REWARD_MIN_EXPOSURE - total_exposure)
+            reward -= self.REWARD_CASH_PENALTY * shortfall
 
         return float(reward)
 
     # ------------------------------------------------------------------
-    # Action -> weights (softmax)
+    # Action mapping (softmax)
     # ------------------------------------------------------------------
 
     def _action_to_weights(self, action: np.ndarray) -> np.ndarray:
         """
-        Converts N+1 raw logits to N asset weights via softmax.
+        Convert N+1 raw policy logits to N asset weights via softmax.
 
-        The last logit is the cash slot.  After softmax, the first N
-        probabilities are the asset weights; the agent holds
-        (1 - sum(asset_weights)) as uninvested balance.
-
-        Softmax guarantees:
-          - all weights in (0, 1)
-          - sum of all N+1 probabilities = 1.0
-          - asset weights sum to (1 - cash_prob) <= 1.0
-          - smooth differentiable gradients throughout
+        The last logit is the cash allocation.  After softmax, the first N
+        probabilities become asset weights; the remainder stays as uninvested
+        balance.  Guarantees all weights in (0, 1) and sum <= 1.0 with smooth
+        differentiable gradients.
         """
-        shifted = action - np.max(action)   # numerical stability
+        shifted = action - np.max(action)
         e       = np.exp(shifted)
-        probs   = e / e.sum()               # shape: (num_assets + 1,)
+        probs   = e / e.sum()
         return probs[:self.num_assets].astype(np.float32)
 
     # ------------------------------------------------------------------
@@ -374,6 +400,7 @@ class DreamEnv(gym.Env):
         delta_weights: np.ndarray,
         prev_portfolio_value: float,
     ) -> None:
+        """Process sell orders for assets whose target weight decreased."""
         for i in range(self.num_assets):
             if delta_weights[i] < -self.DELTA_WEIGHT_THRESHOLD:
                 units = min(
@@ -390,6 +417,7 @@ class DreamEnv(gym.Env):
         delta_weights: np.ndarray,
         prev_portfolio_value: float,
     ) -> None:
+        """Process buy orders for assets whose target weight increased."""
         for i in range(self.num_assets):
             if delta_weights[i] > self.DELTA_WEIGHT_THRESHOLD:
                 invest = min(
