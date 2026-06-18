@@ -1,16 +1,26 @@
 <div align="center">
-  <img src="img/logoDREAM.png" width="300" alt="DREAM Logo">
-  <br>
-  <br>
-  <img src="img/logo_unir.png" width="200" alt="UNIR Logo">
+  <img align="center" src="img/logoDREAM.png" width="150" alt="DREAM Logo">
 </div>
 
-# D.R.E.A.M. 
-**Arquitectura Multi-Agente para Trading basada en Fusión de Sentimiento y Volatilidad**
+<div align="center">
+  <h1>D.R.E.A.M.</h1>
+  <strong>Arquitectura Multi-Agente para Trading basada en Fusión de Sentimiento y Volatilidad</strong>
+</div>
 
-> **Trabajo Fin de Máster (TFM)**  
-> Máster Universitario en Inteligencia Artificial  
-> *Universidad Internacional de La Rioja (UNIR)*
+<br clear="all">
+<br>
+
+<img align="right" src="img/logo_unir.png" width="300" alt="UNIR Logo">
+
+<div>
+  <blockquote>
+    <strong>Trabajo Fin de Máster (TFM)</strong><br>
+    Máster Universitario en Inteligencia Artificial<br>
+    <em>Universidad Internacional de La Rioja (UNIR)</em>
+  </blockquote>
+</div>
+
+<br clear="all">
 
 ---
 
@@ -24,7 +34,7 @@ El sistema se compone de tres fases fuertemente acopladas:
 3. **Agente Autónomo de Trading:** El cerebro del sistema. Recibe la volatilidad, el sentimiento macroeconómico y los retornos históricos para rebalancear la cartera dinámicamente y ejecutar órdenes de compra/venta maximizando el *Sharpe Ratio*.
 
 <div align="center">
-  <img src="img/pipeline.png" width="800" alt="DREAM Pipeline">
+  <img src="img/pipeline.png" width="900" alt="DREAM Pipeline">
 </div>
 
 ---
